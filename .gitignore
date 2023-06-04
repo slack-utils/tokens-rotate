@@ -1,0 +1,4 @@
+.task
+build/package/etc/tokens-rotate/*.json
+build/package/etc/tokens-rotate/*.yaml
+build/package/usr/local/sbin/*
