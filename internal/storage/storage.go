@@ -1,15 +1,13 @@
+//go:generate mockgen -source=${GOFILE} -destination=mock/${GOFILE}
 package storage
 
 import (
-	"fmt"
+	"context"
 	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/slack-go/slack"
-	"github.com/spf13/viper"
 
 	"github.com/slack-utils/tokens-rotate/internal/storage/awssecrets"
 	"github.com/slack-utils/tokens-rotate/internal/storage/fs"
@@ -17,136 +15,129 @@ import (
 )
 
 type Storage interface {
+	LoadTokensFromEnv()
 	Read() error
 	Save() error
 	StorageGetName() string
-	TokenGetAccess() (string, error)
-	TokenGetExpirationTime() (int64, error)
-	TokenGetRefresh() (string, error)
-	TokenSetAccess(string) string
-	TokenSetExpirationTime(int64) int64
-	TokenSetRefresh(string) string
+	TokenGetAccess() string
+	TokenGetExpirationTime() int64
+	TokenGetRefresh() string
+	TokenSetAccess(string)
+	TokenSetExpirationTime(int64)
+	TokenSetRefresh(string)
 }
 
-var (
-	api         *slack.Client
-	err         error
-	storages    = map[string]Storage{}
-	retry_limit = 3
-
-	access_token    string
-	expiration_time int64
-	refresh_token   string
-	storage         string
-)
-
-func Run() {
-	go rotation(pre())
-
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
-
-	sig := <-sigs
-
-	log.WithFields(log.Fields{
-		"signal": sig.String(),
-		"code":   fmt.Sprintf("%d", sig),
-	}).Info("Signal notify")
+type SlackClient interface {
+	AuthTest() (*slack.AuthTestResponse, error)
+	ToolingTokensRotate(refresh_token string) (*slack.ToolingTokensRotate, error)
 }
 
-func pre() Storage {
-	if storage = viper.GetString("storage"); storages[storage] == nil {
-		log.WithField("storage", storage).Fatal("Unknown storage")
-	}
+type SlackClientFactory func(string, ...slack.Option) SlackClient
 
-	s := storages[storage]
+type App struct {
+	SlackClient
+	Storage
 
-	if err := s.Read(); err != nil {
-		log.WithField("err", err).Fatal("failed to read token from storage")
-	}
-
-	if access_token, err = s.TokenGetAccess(); err != nil {
-		log.Fatalf("failed to get access token: %s", err)
-	} else if access_token == "" {
-		access_token = viper.GetString("access_token")
-	}
-
-	if refresh_token, err = s.TokenGetRefresh(); err != nil {
-		log.Fatalf("failed to get refresh token: %s", err)
-	} else if refresh_token == "" {
-		refresh_token = viper.GetString("refresh_token")
-	}
-
-	if expiration_time, err = s.TokenGetExpirationTime(); err != nil {
-		log.Fatalf("failed to get expiration time: %s", err)
-	} else if expiration_time == 0 {
-		expiration_time = time.Now().Add(time.Hour * time.Duration(12)).Unix()
-	}
-
-	if access_token == "" || refresh_token == "" {
-		log.Fatal("access or refresh token is empty")
-	}
-
-	return s
+	factory SlackClientFactory
 }
 
-func rotation(s Storage) {
-	api = slack.New(access_token)
+func (a *App) tokenRotate() {
+	log.Info("rotating token")
+	token, err := a.ToolingTokensRotate(a.TokenGetRefresh())
+	if err != nil {
+		log.WithField("err", err).Error("failed to rotate token")
 
-	log.Info("checking the current token")
-	if _, err := api.AuthTest(); err != nil {
-		log.Errorf("the current token is invalid: %s", err)
-		access_token = ""
-	}
+		a.LoadTokensFromEnv()
+		retry_limit := 3
 
-	for {
-		if access_token != "" {
-			log.Infof("next rotation in %s", time.Unix(expiration_time, 0))
-			time.Sleep(time.Second * time.Duration(expiration_time-time.Now().Add(time.Hour).Unix()))
-		}
+		for {
+			time.Sleep(time.Second)
 
-		log.Info("rotation of the token")
-		token, err := api.ToolingTokensRotate(refresh_token)
-		if err != nil {
+			if token, err = a.ToolingTokensRotate(a.TokenGetRefresh()); err == nil {
+				break
+			}
+
 			log.WithField("err", err).Error("failed to rotate token")
 
-			refresh_token = viper.GetString("refresh_token")
-
-			retry_limit -= 1
+			retry_limit--
 
 			if retry_limit < 1 {
 				os.Exit(1)
 			}
-
-			time.Sleep(time.Second)
-
-			continue
 		}
+	}
 
-		access_token = s.TokenSetAccess(token.Token)
-		expiration_time = s.TokenSetExpirationTime(token.Exp)
-		refresh_token = s.TokenSetRefresh(token.RefreshToken)
+	a.TokenSetAccess(token.Token)
+	a.TokenSetExpirationTime(token.Exp)
+	a.TokenSetRefresh(token.RefreshToken)
 
-		if err := s.Save(); err != nil {
-			log.WithField("err", err).Error()
+	log.Info("saving new token")
+	if err := a.Save(); err != nil {
+		log.WithField("err", err).Error()
 
-			continue
+		return
+	}
+
+	a.SlackClient = a.factory(a.TokenGetAccess())
+}
+
+func (a *App) Run(ctx context.Context, duration time.Duration) {
+	log.Info("launch the ticker")
+
+	t := time.NewTicker(duration)
+	defer t.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			log.Info("ticker launch of the check")
+			a.check()
 		}
-
-		api = slack.New(access_token)
 	}
 }
 
-func init() {
-	list := []Storage{
-		awssecrets.New(),
-		fs.New(),
-		vault.New(),
+func (a *App) check() {
+	a.SlackClient = a.factory(a.TokenGetAccess())
+
+	log.Info("checking access token")
+	if token, err := a.AuthTest(); err != nil {
+		log.WithField("err", err).Error("failed to verify current token")
+		a.tokenRotate()
+	} else {
+		log.Debugf("%#v", token)
+	}
+}
+
+func NewSlack(storage Storage, factory SlackClientFactory) *App {
+	a := &App{
+		factory: factory,
+		Storage: storage,
 	}
 
-	for _, item := range list {
-		name := item.StorageGetName()
+	log.Info("initial launch of the check")
+	a.check()
 
-		storages[name] = item
+	return a
+}
+
+func New(storageType string) Storage {
+	var s Storage
+
+	switch storageType {
+	case "awssecrets":
+		s = awssecrets.New()
+	case "fs":
+		s = fs.New()
+	case "vault":
+		s = vault.New()
 	}
+
+	if err := s.Read(); err != nil {
+		log.WithField("err", err).Error("reading was failed")
+		s.LoadTokensFromEnv()
+	}
+
+	return s
 }

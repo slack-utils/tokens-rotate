@@ -13,8 +13,7 @@ As a storage, you can choose one of the following:
 - [Hashicorp Vault](internal/storage/vault)
 
 ## Requirements
-To run the utility, you need to pass `access_token` and `refresh_token` through environment variables:
-- `ROTATOR_ACCESS_TOKEN` - xoxe.xoxp-1-***
+To run the utility, you need to pass `refresh_token` through environment variables:
 - `ROTATOR_REFRESH_TOKEN` - xoxe-1-***
 
 If there are already tokens in the storage and they have expired, tokens from the environment variables will be used and stored in the storage.

@@ -32,14 +32,17 @@ package cmd
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
 
 	log "github.com/sirupsen/logrus"
-	"github.com/slack-utils/tokens-rotate/internal/shared"
+	"github.com/sirupsen/logrus/hooks/writer"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
+
+	"github.com/slack-utils/tokens-rotate/internal/shared"
 )
 
 var (
@@ -85,6 +88,7 @@ func initConfig() {
 		log.WithField("err", err).Fatal("can't parse log level")
 	}
 
+	log.SetOutput(io.Discard)
 	log.SetLevel(level)
 	log.SetFormatter(
 		&log.TextFormatter{
@@ -93,6 +97,24 @@ func initConfig() {
 			TimestampFormat: time.RFC3339,
 		},
 	)
+
+	log.AddHook(&writer.Hook{
+		Writer: os.Stderr,
+		LogLevels: []log.Level{
+			log.PanicLevel,
+			log.FatalLevel,
+			log.ErrorLevel,
+			log.WarnLevel,
+		},
+	})
+
+	log.AddHook(&writer.Hook{
+		Writer: os.Stdout,
+		LogLevels: []log.Level{
+			log.InfoLevel,
+			log.DebugLevel,
+		},
+	})
 
 	if logFormat == "json" {
 		log.SetFormatter(&log.JSONFormatter{

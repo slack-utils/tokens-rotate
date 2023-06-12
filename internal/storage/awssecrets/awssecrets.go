@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
@@ -14,46 +15,48 @@ import (
 	"github.com/slack-utils/tokens-rotate/internal/shared"
 )
 
-type Storage struct {
-	shared.Token
-
-	name string
+type Client interface {
+	GetSecretValue(context.Context, *secretsmanager.GetSecretValueInput, ...func(*secretsmanager.Options)) (*secretsmanager.GetSecretValueOutput, error)
+	CreateSecret(context.Context, *secretsmanager.CreateSecretInput, ...func(*secretsmanager.Options)) (*secretsmanager.CreateSecretOutput, error)
+	PutSecretValue(context.Context, *secretsmanager.PutSecretValueInput, ...func(*secretsmanager.Options)) (*secretsmanager.PutSecretValueOutput, error)
 }
 
-var (
-	client     *secretsmanager.Client
+type Storage struct {
+	shared.GeneralStorage
+
+	client     Client
 	l          *log.Entry
-	notFound   *types.ResourceNotFoundException
+	name       string
 	secretName string
-)
+}
+
+var notFound *types.ResourceNotFoundException
 
 func (s *Storage) StorageGetName() string {
 	return s.name
 }
 
 func (s *Storage) Read() error {
-	s.init()
-
-	if res, err := client.GetSecretValue(
+	if res, err := s.client.GetSecretValue(
 		context.Background(),
 		&secretsmanager.GetSecretValueInput{
-			SecretId: &secretName,
+			SecretId: &s.secretName,
 		},
 	); err != nil {
 		if errors.As(err, &notFound) {
 			secretString := "{}"
 
-			if _, err := client.CreateSecret(
+			if _, err := s.client.CreateSecret(
 				context.Background(),
 				&secretsmanager.CreateSecretInput{
-					Name:         &secretName,
+					Name:         &s.secretName,
 					SecretString: &secretString,
 				},
 			); err != nil {
 				return err
 			}
 
-			return nil
+			return fmt.Errorf("secret not fount")
 		}
 
 		return err
@@ -67,8 +70,6 @@ func (s *Storage) Read() error {
 }
 
 func (s *Storage) Save() error {
-	s.init()
-
 	data, err := json.Marshal(s.Token)
 	if err != nil {
 		return err
@@ -76,10 +77,10 @@ func (s *Storage) Save() error {
 
 	secretString := string(data)
 
-	if _, err := client.PutSecretValue(
+	if _, err := s.client.PutSecretValue(
 		context.Background(),
 		&secretsmanager.PutSecretValueInput{
-			SecretId:     &secretName,
+			SecretId:     &s.secretName,
 			SecretString: &secretString,
 		},
 	); err != nil {
@@ -89,55 +90,24 @@ func (s *Storage) Save() error {
 	return nil
 }
 
-func (s *Storage) TokenGetAccess() (string, error) {
-	return s.AccessToken, nil
-}
-
-func (s *Storage) TokenGetExpirationTime() (int64, error) {
-	return s.Exp, nil
-}
-
-func (s *Storage) TokenGetRefresh() (string, error) {
-	return s.RefreshToken, nil
-}
-
-func (s *Storage) TokenSetAccess(value string) string {
-	s.AccessToken = value
-
-	return value
-}
-
-func (s *Storage) TokenSetExpirationTime(value int64) int64 {
-	s.Exp = value
-
-	return value
-}
-
-func (s *Storage) TokenSetRefresh(value string) string {
-	s.RefreshToken = value
-
-	return value
-}
-
-func (s *Storage) init() {
-	if client == nil {
-		cfg, err := config.LoadDefaultConfig(context.Background())
-		if err != nil {
-			l.WithField("err", err).Fatal("failed get config")
-		}
-
-		client = secretsmanager.NewFromConfig(cfg)
-
-		secretName = viper.GetString("awssecrets.secret_name")
+func NewClient() Client {
+	cfg, err := config.LoadDefaultConfig(context.Background())
+	if err != nil {
+		log.WithField("err", err).Fatal("failed get config")
 	}
+
+	return secretsmanager.NewFromConfig(cfg)
 }
 
 func New() *Storage {
 	viper.SetDefault("awssecrets.secret_name", shared.PkgName)
 
-	l = log.WithField("storage", "awssecrets")
-
-	return &Storage{
-		name: "awssecrets",
+	s := &Storage{
+		client:     NewClient(),
+		l:          log.WithField("storage", "awssecrets"),
+		name:       "awssecrets",
+		secretName: viper.GetString("awssecrets.secret_name"),
 	}
+
+	return s
 }

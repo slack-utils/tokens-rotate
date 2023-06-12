@@ -31,15 +31,35 @@ POSSIBILITY OF SUCH DAMAGE.
 package cmd
 
 import (
-	"github.com/slack-utils/tokens-rotate/internal/storage"
+	"context"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/slack-go/slack"
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
+
+	"github.com/slack-utils/tokens-rotate/internal/storage"
 )
 
 var refreshCmd = &cobra.Command{
 	Use:   "refresh",
 	Short: "Checking and refreshing the access token",
 	Run: func(cmd *cobra.Command, args []string) {
-		storage.Run()
+		s := storage.New(viper.GetString("storage"))
+		c := storage.NewSlack(s, func(token string, options ...slack.Option) storage.SlackClient {
+			return slack.New(token, options...)
+		})
+
+		ctx, stop := signal.NotifyContext(
+			context.Background(),
+			syscall.SIGINT,
+			syscall.SIGTERM,
+		)
+		defer stop()
+
+		c.Run(ctx, time.Minute)
 	},
 }
 
